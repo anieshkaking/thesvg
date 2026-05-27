@@ -95,16 +95,115 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Tag each package with its current version if not already tagged
-          for PKG_DIR in packages/icons packages/thesvg packages/cli packages/mcp packages/react packages/vue packages/svelte; do
-            if [ ! -d "$PKG_DIR" ]; then continue; fi
+          for PKG_DIR in packages/*/; do
+            PKG_DIR="${PKG_DIR%/}"
+            [ -f "$PKG_DIR/package.json" ] || continue
             PKG_NAME=$(node -p "require('./$PKG_DIR/package.json').name")
             PKG_VERSION=$(node -p "require('./$PKG_DIR/package.json').version")
             TAG="$PKG_NAME@$PKG_VERSION"
             if ! git rev-parse "$TAG" >/dev/null 2>&1; then
               echo "Creating tag: $TAG"
               git tag "$TAG"
-              git push origin "$TAG" || true
+              # Tag push must succeed — the per-package GitHub release step
+              # below uses --verify-tag and will fail if the tag isn't on
+              # the remote.
+              git push origin "$TAG"
             fi
           done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub releases per package
+        # Create one GitHub release per just-published package, with the
+        # release body sourced from that package's CHANGELOG.md section
+        # for the current version. This:
+        #   1. Fires `on: release: published` for downstream automations
+        #      (e.g. homebrew-tap-update, which gates on @thesvg/cli@*).
+        #   2. Gives each package a discoverable release page on GitHub
+        #      with the changeset entries that landed in that version.
+        run: |
+          # Note: deliberately not using `set -e`. We want one failing
+          # release (e.g. flaky gh API) not to skip releases for every
+          # later package. We track failures and exit non-zero at the
+          # end so the workflow surfaces the problem.
+          failed=()
+
+          # Extract the section between `## <version>` and the next `## ` (or EOF)
+          # from a changesets-generated CHANGELOG.md. Echoes nothing if the
+          # section is absent.
+          extract_section() {
+            local file="$1" version="$2"
+            awk -v ver="## ${version}" '
+              $0 == ver { capture = 1; next }
+              capture && /^## / { exit }
+              capture { print }
+            ' "$file"
+          }
+
+          for PKG_DIR in packages/*/; do
+            PKG_DIR="${PKG_DIR%/}"
+            [ -f "$PKG_DIR/package.json" ] || continue
+            PKG_NAME=$(node -p "require('./$PKG_DIR/package.json').name")
+            PKG_VERSION=$(node -p "require('./$PKG_DIR/package.json').version")
+            PKG_PRIVATE=$(node -p "require('./$PKG_DIR/package.json').private || false")
+            if [ "$PKG_PRIVATE" = "true" ]; then continue; fi
+
+            TAG="$PKG_NAME@$PKG_VERSION"
+
+            # Only create a release if the git tag exists (created above)
+            # and the release doesn't already exist.
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "Skipping $TAG (no git tag)"
+              continue
+            fi
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Skipping $TAG (release exists)"
+              continue
+            fi
+
+            # Build release body from CHANGELOG.md section
+            CHANGELOG="$PKG_DIR/CHANGELOG.md"
+            BODY_FILE="$(mktemp)"
+            {
+              echo "## $PKG_NAME $PKG_VERSION"
+              echo
+              if [ -f "$CHANGELOG" ]; then
+                SECTION=$(extract_section "$CHANGELOG" "$PKG_VERSION")
+                if [ -n "$SECTION" ]; then
+                  echo "$SECTION"
+                else
+                  echo "_No changelog entry found for version $PKG_VERSION._"
+                fi
+              else
+                echo "_Package has no CHANGELOG.md._"
+              fi
+              echo
+              echo "---"
+              echo
+              if [ "$PKG_NAME" = "@thesvg/cli" ]; then
+                echo "Install: \`brew install glincker/thesvg/thesvg\` or \`npm i -g @thesvg/cli\`"
+              else
+                echo "Install: \`npm i $PKG_NAME@$PKG_VERSION\`"
+              fi
+              echo "Tarball: https://registry.npmjs.org/$PKG_NAME/-/$(basename $PKG_NAME)-$PKG_VERSION.tgz"
+            } > "$BODY_FILE"
+
+            echo "Creating GitHub release for $TAG"
+            if gh release create "$TAG" \
+                 --title "$PKG_NAME $PKG_VERSION" \
+                 --notes-file "$BODY_FILE" \
+                 --verify-tag; then
+              echo "Created release $TAG"
+            else
+              echo "::error::failed to create release for $TAG"
+              failed+=("$TAG")
+            fi
+            rm -f "$BODY_FILE"
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::${#failed[@]} release(s) failed: ${failed[*]}"
+            exit 1
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
